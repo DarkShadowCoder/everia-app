@@ -1,0 +1,93 @@
+{
+  "expo": {
+    "name": "Everia",
+    "slug": "everia",
+    "scheme": "everia",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "icon": "./assets/icon.png",
+    "userInterfaceStyle": "dark",
+    "backgroundColor": "#160A18",
+    "splash": {
+      "image": "./assets/splash-icon.png",
+      "resizeMode": "contain",
+      "backgroundColor": "#160A18"
+    },
+    "assetBundlePatterns": [
+      "**/*"
+    ],
+    "ios": {
+      "supportsTablet": false,
+      "bundleIdentifier": "com.everia.app",
+      "config": {
+        "usesNonExemptEncryption": false
+      },
+      "infoPlist": {
+        "NSCameraUsageDescription": "Everia a besoin de la caméra pour capturer vos photos et vidéos pendant l'événement.",
+        "NSMicrophoneUsageDescription": "Everia a besoin du micro pour enregistrer vos vidéos et messages du livre d'or.",
+        "NSPhotoLibraryUsageDescription": "Everia a besoin d'accéder à votre galerie pour importer des photos et vidéos.",
+        "NSPhotoLibraryAddUsageDescription": "Everia peut enregistrer vos souvenirs dans votre galerie."
+      }
+    },
+    "android": {
+      "package": "com.everia.app",
+      "adaptiveIcon": {
+        "foregroundImage": "./assets/adaptive-icon.png",
+        "backgroundColor": "#1B0B1D"
+      },
+      "permissions": [
+        "CAMERA",
+        "RECORD_AUDIO",
+        "READ_EXTERNAL_STORAGE",
+        "WRITE_EXTERNAL_STORAGE",
+        "POST_NOTIFICATIONS"
+      ]
+    },
+    "web": {
+      "favicon": "./assets/favicon.png",
+      "bundler": "metro"
+    },
+    "plugins": [
+      "expo-router",
+      "expo-secure-store",
+      "expo-font",
+      [
+        "expo-camera",
+        {
+          "cameraPermission": "Everia a besoin de la caméra pour capturer vos moments.",
+          "microphonePermission": "Everia a besoin du micro pour vos vidéos.",
+          "recordAudioAndroid": true
+        }
+      ],
+      [
+        "expo-image-picker",
+        {
+          "photosPermission": "Everia a besoin d'accéder à vos photos pour les partager sur l'événement."
+        }
+      ],
+      [
+        "expo-notifications",
+        {
+          "icon": "./assets/adaptive-icon.png",
+          "color": "#5B315D"
+        }
+      ],
+      [
+        "@stripe/stripe-react-native",
+        {
+          "merchantIdentifier": "merchant.com.everia.app",
+          "enableGooglePay": true
+        }
+      ],
+      "expo-asset"
+    ],
+    "extra": {
+      "router": {
+        "origin": false
+      },
+      "eas": {
+        "projectId": "94d5aba9-7703-4f6e-8c03-6e15cb53a194"
+      }
+    }
+  }
+}
