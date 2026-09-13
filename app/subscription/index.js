@@ -1,106 +1,313 @@
 // app/subscription/index.js
-// ------------------------------------------------------------
-// Paywall premium Everia. Inspiré des meilleurs paywalls du marché
-// (héros avec proposition de valeur forte, cartes de plans
-// sélectionnables avec état actif marqué, barre d'action collante
-// en bas, preuve sociale, micro-animations). Utilise le PaymentSheet
-// natif Stripe. Conformément au principe du spec produit, l'UI
-// attend la confirmation serveur (webhook) avant d'annoncer un
-// succès — voir lib/stripe.waitForPaymentConfirmation.
-// ------------------------------------------------------------
+// ============================================================
+// EVERIA — CONTEXTUAL PAYWALL
+// ============================================================
+// Trois offres visibles par contexte, une promesse de résultat avant les
+// quotas, et le serveur comme source de vérité au moment du paiement.
+// ============================================================
 
-import React, { useEffect, useMemo, useRef, useState } from 'react';
-import { Animated, Easing, Pressable, ScrollView, StyleSheet, Text, View } from 'react-native';
-import { SafeAreaView } from 'react-native-safe-area-context';
-import { LinearGradient } from 'expo-linear-gradient';
-import { BlurView } from 'expo-blur';
+import React, {
+  useEffect,
+  useMemo,
+  useState,
+} from 'react';
+
+import {
+  Pressable,
+  ScrollView,
+  StyleSheet,
+  Text,
+  View,
+} from 'react-native';
+
+import {
+  SafeAreaView,
+} from 'react-native-safe-area-context';
+
+import {
+  LinearGradient,
+} from 'expo-linear-gradient';
+
 import * as Haptics from 'expo-haptics';
-import { useStripe } from '@stripe/stripe-react-native';
-import { router, useLocalSearchParams } from 'expo-router';
-import { Ionicons } from '@expo/vector-icons';
+
+import {
+  useStripe,
+} from '@stripe/stripe-react-native';
+
+import {
+  router,
+  useLocalSearchParams,
+} from 'expo-router';
+
+import {
+  Ionicons,
+} from '@expo/vector-icons';
+
 import theme from '@/theme';
-import LoadingOverlay from '@/components/ui/LoadingOverlay';
 import IconButton from '@/components/ui/IconButton';
+import LoadingOverlay from '@/components/ui/LoadingOverlay';
 import { useSupabaseQuery } from '@/hooks/useSupabaseQuery';
 import { useUIStore } from '@/store/uiStore';
-import { createCheckoutSession, fetchBillingPlans, waitForPaymentConfirmation } from '@/lib/stripe';
-import { formatPrice } from '@/lib/format';
+import {
+  createCheckoutSession,
+  fetchBillingPlans,
+  waitForPaymentConfirmation,
+} from '@/lib/stripe';
+import {
+  APP_SCHEME,
+} from '@/constants/config';
+import {
+  getCatalogPlans,
+  isPaywallMode,
+  mergePlanWithCatalog,
+  PAYWALL_MODES,
+} from '@/lib/productCatalog';
+import {
+  formatPrice,
+} from '@/lib/format';
 
-// Proposition de valeur générique Everia+, affichée au-dessus du choix de
-// plan indépendamment des données serveur (marketing statique).
-const HERO_BENEFITS = [
-  { icon: 'cloud-upload-outline', label: 'Uploads photo & vidéo illimités' },
-  { icon: 'sparkles-outline', label: 'Moments générés automatiquement par IA' },
-  { icon: 'film-outline', label: 'Replay & Best Of en qualité HD prioritaire' },
-  { icon: 'infinite-outline', label: "Événements illimités, à vie" },
-];
+const PAYWALL_COPY = {
+  [PAYWALL_MODES.EVENT]: {
+    eyebrow: 'POUR UN ÉVÉNEMENT',
+    title: 'Offrez plus qu’une galerie.',
+    description: 'Chaque invité participe gratuitement. Vous choisissez l’histoire qu’il emportera avec lui.',
+    proof: 'Paiement unique · Invités gratuits · Aucun frais par participant',
+    emptyAction: 'Créer mon événement',
+    footer: 'Besoin d’un accompagnement premium ? Signature inclut une expérience entièrement à votre image.',
+  },
+  [PAYWALL_MODES.PROFESSIONAL]: {
+    eyebrow: 'POUR LES PROFESSIONNELS',
+    title: 'Transformez chaque événement en offre signature.',
+    description: 'Déployez une expérience mémoire premium, revendez-la à vos clients et gardez la main sur votre marque.',
+    proof: 'Facturation mensuelle · Invités gratuits · Évolue avec votre activité',
+    emptyAction: 'Comparer les offres Pro',
+    footer: 'White-label, SSO et API sont disponibles avec une offre Enterprise sur mesure.',
+  },
+};
 
-const SOCIAL_PROOF = [
-  { icon: 'people-outline', value: '12k+', label: 'Événements créés' },
-  { icon: 'star', value: '4.9', label: 'Note moyenne' },
-  { icon: 'shield-checkmark-outline', value: '100%', label: 'Paiement sécurisé' },
-];
+function firstValue(value) {
+  return Array.isArray(value)
+    ? value[0]
+    : value;
+}
+
+function displayPrice(plan) {
+  return formatPrice(
+    plan.priceCents ??
+      plan.price_cents ??
+      0,
+    plan.currency || 'EUR'
+  );
+}
+
+function intervalLabel(plan) {
+  const interval = plan.billingInterval || plan.billing_interval;
+
+  if (interval === 'month') {
+    return '/ mois';
+  }
+
+  if (interval === 'year') {
+    return '/ an';
+  }
+
+  return 'paiement unique';
+}
 
 export default function Subscription() {
-  const { eventId } = useLocalSearchParams();
-  const { initPaymentSheet, presentPaymentSheet } = useStripe();
-  const showToast = useUIStore((s) => s.showToast);
-  const [processingPlan, setProcessingPlan] = useState(null);
-  const [selectedCode, setSelectedCode] = useState(null);
+  const {
+    eventId: rawEventId,
+    mode: rawMode,
+  } = useLocalSearchParams();
 
-  const { data: allPlans, isLoading } = useSupabaseQuery(() => fetchBillingPlans(), []);
+  const eventId = firstValue(rawEventId);
+  const requestedMode = firstValue(rawMode);
+  const [
+    mode,
+    setMode,
+  ] = useState(
+    isPaywallMode(requestedMode)
+      ? requestedMode
+      : PAYWALL_MODES.EVENT
+  );
 
-  // Le plan "free" ne se sélectionne pas sur un paywall — il reste
-  // accessible via le lien discret en bas d'écran.
-  const paidPlans = useMemo(() => (allPlans || []).filter((p) => p.code !== 'free'), [allPlans]);
-  const freePlan = useMemo(() => (allPlans || []).find((p) => p.code === 'free'), [allPlans]);
+  const [
+    selectedCode,
+    setSelectedCode,
+  ] = useState(null);
 
-  useEffect(() => {
-    if (paidPlans.length && !selectedCode) {
-      const featured = paidPlans.find((p) => p.code === 'everia_plus') || paidPlans[0];
-      setSelectedCode(featured.code);
+  const [
+    processingCode,
+    setProcessingCode,
+  ] = useState(null);
+
+  const {
+    initPaymentSheet,
+    presentPaymentSheet,
+  } = useStripe();
+
+  const showToast = useUIStore(
+    (state) => state.showToast
+  );
+
+  const {
+    data: serverPlans,
+    isLoading,
+    refresh,
+  } = useSupabaseQuery(
+    () => fetchBillingPlans(),
+    []
+  );
+
+  useEffect(
+    () => {
+      if (
+        isPaywallMode(requestedMode) &&
+        requestedMode !== mode
+      ) {
+        setMode(requestedMode);
+      }
+    }, [
+      requestedMode,
+      mode,
+    ]);
+
+  const plans = useMemo(() => {
+    const plansByCode = new Map(
+      (serverPlans || []).map(
+        (plan) => [
+          plan.code,
+          plan,
+        ]
+      )
+    );
+
+    return getCatalogPlans(mode).map(
+      (catalogPlan) => {
+        const serverPlan = plansByCode.get(
+          catalogPlan.code
+        );
+
+        const displayedPlan = serverPlan
+          ? mergePlanWithCatalog(serverPlan)
+          : catalogPlan;
+
+        return {
+          ...displayedPlan,
+          available: Boolean(serverPlan?.id),
+          serverPlan,
+        };
+      }
+    );
+  }, [
+    mode,
+    serverPlans,
+  ]);
+
+  const selectedPlan = plans.find(
+    (plan) => plan.code === selectedCode
+  ) || null;
+
+  useEffect(
+    () => {
+      const featuredPlan = plans.find(
+        (plan) => plan.badge && plan.available
+      );
+
+      const firstAvailablePlan = plans.find(
+        (plan) => plan.available
+      );
+
+      const nextSelection =
+        featuredPlan ||
+        firstAvailablePlan ||
+        plans[0] ||
+        null;
+
+      if (
+        nextSelection &&
+        !plans.some(
+          (plan) => plan.code === selectedCode
+        )
+      ) {
+        setSelectedCode(nextSelection.code);
+      }
+    }, [
+      plans,
+      selectedCode,
+    ]);
+
+  const switchMode = (nextMode) => {
+    if (nextMode === mode) {
+      return;
     }
-  }, [paidPlans, selectedCode]);
 
-  const selectedPlan = paidPlans.find((p) => p.code === selectedCode);
-
-  // --- Animations d'entrée -------------------------------------------------
-  const heroAnim = useRef(new Animated.Value(0)).current;
-  const listAnim = useRef(new Animated.Value(0)).current;
-  const ctaAnim = useRef(new Animated.Value(0)).current;
-  const badgePulse = useRef(new Animated.Value(0)).current;
-
-  useEffect(() => {
-    Animated.stagger(120, [
-      Animated.timing(heroAnim, { toValue: 1, duration: 500, easing: Easing.out(Easing.cubic), useNativeDriver: true }),
-      Animated.timing(listAnim, { toValue: 1, duration: 500, easing: Easing.out(Easing.cubic), useNativeDriver: true }),
-      Animated.timing(ctaAnim, { toValue: 1, duration: 450, easing: Easing.out(Easing.cubic), useNativeDriver: true }),
-    ]).start();
-
-    Animated.loop(
-      Animated.sequence([
-        Animated.timing(badgePulse, { toValue: 1, duration: 900, easing: Easing.inOut(Easing.ease), useNativeDriver: true }),
-        Animated.timing(badgePulse, { toValue: 0, duration: 900, easing: Easing.inOut(Easing.ease), useNativeDriver: true }),
-      ])
-    ).start();
-  }, []);
-
-  const selectPlan = (code) => {
     Haptics.selectionAsync();
-    setSelectedCode(code);
+    setMode(nextMode);
+    setSelectedCode(null);
   };
 
-  const handleSubscribe = async () => {
-    if (!selectedPlan) return;
-    Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium);
-    setProcessingPlan(selectedPlan.code);
+  const selectPlan = (plan) => {
+    if (!plan.available) {
+      showToast(
+        'Cette offre sera disponible dès que la configuration de facturation aura été publiée.',
+        'warning'
+      );
+
+      return;
+    }
+
+    Haptics.selectionAsync();
+    setSelectedCode(plan.code);
+  };
+
+  const openCheckout = async () => {
+    if (!selectedPlan) {
+      return;
+    }
+
+    if (!selectedPlan.available) {
+      showToast(
+        'Cette offre n’est pas encore disponible au paiement.',
+        'warning'
+      );
+
+      return;
+    }
+
+    if (
+      mode === PAYWALL_MODES.EVENT &&
+      !eventId
+    ) {
+      showToast(
+        'Créez d’abord votre événement : nous appliquerons ensuite cette formule à la bonne expérience.',
+        'info'
+      );
+
+      router.push('/create-event');
+      return;
+    }
+
+    Haptics.impactAsync(
+      Haptics.ImpactFeedbackStyle.Medium
+    );
+
+    setProcessingCode(selectedPlan.code);
+
     try {
-      const session = await createCheckoutSession({ planCode: selectedPlan.code, eventId });
-      const { error: initError } = await initPaymentSheet({
+      const session = await createCheckoutSession({
+        planCode: selectedPlan.code,
+        eventId,
+      });
+
+      const {
+        error: initError,
+      } = await initPaymentSheet({
         merchantDisplayName: 'Everia',
         customerId: session.customerId,
         customerEphemeralKeySecret: session.ephemeralKey,
         paymentIntentClientSecret: session.clientSecret,
+        returnURL: `${APP_SCHEME}://stripe-redirect`,
         style: 'alwaysDark',
         appearance: {
           colors: {
@@ -110,170 +317,297 @@ export default function Subscription() {
           },
         },
       });
-      if (initError) throw new Error(initError.message);
 
-      const { error: presentError } = await presentPaymentSheet();
+      if (initError) {
+        throw new Error(initError.message);
+      }
+
+      const {
+        error: presentError,
+      } = await presentPaymentSheet();
+
       if (presentError) {
-        if (presentError.code !== 'Canceled') showToast(presentError.message, 'error');
+        if (
+          presentError.code !== 'Canceled'
+        ) {
+          showToast(
+            presentError.message,
+            'error'
+          );
+        }
+
         return;
       }
 
-      showToast('Paiement en cours de confirmation...', 'info');
-      const result = await waitForPaymentConfirmation(session.paymentIntentId);
+      showToast(
+        'Confirmation sécurisée du paiement en cours…',
+        'info'
+      );
+
+      const result =
+        await waitForPaymentConfirmation(
+          session.paymentIntentId
+        );
+
       if (result.confirmed) {
-        showToast(`Bienvenue dans ${selectedPlan.name} !`, 'success');
+        showToast(
+          `Votre offre ${selectedPlan.name} est active.`,
+          'success'
+        );
+
         router.back();
       } else {
-        showToast("Le paiement n'a pas pu être confirmé. Vérifiez votre compte dans quelques instants.", 'warning');
+        showToast(
+          'Le paiement a été reçu mais la confirmation prend plus de temps que prévu. Vérifiez votre espace dans quelques instants.',
+          'warning'
+        );
       }
-    } catch (err) {
-      showToast(err.message || 'Une erreur est survenue.', 'error');
+    } catch (error) {
+      showToast(
+        error?.message ||
+          'Le paiement n’a pas pu être initialisé.',
+        'error'
+      );
     } finally {
-      setProcessingPlan(null);
+      setProcessingCode(null);
     }
   };
 
-  return (
-    <LinearGradient colors={theme.gradients.darkLuxury} style={{ flex: 1 }}>
-      {/* Halo décoratif façon spotlight derrière le héros */}
-      <View pointerEvents="none" style={styles.glowWrap}>
-        <LinearGradient
-          colors={['rgba(217,184,120,0.28)', 'rgba(217,184,120,0)']}
-          style={styles.glow}
-        />
-      </View>
-      <Ionicons name="sparkles" size={16} color="rgba(217,184,120,0.5)" style={styles.sparkleTL} />
-      <Ionicons name="sparkles" size={12} color="rgba(217,184,120,0.35)" style={styles.sparkleTR} />
+  const copy = PAYWALL_COPY[mode];
+  const hasAvailablePlans = plans.some(
+    (plan) => plan.available
+  );
 
-      <SafeAreaView style={{ flex: 1 }} edges={['top', 'bottom']}>
+  return (
+    <LinearGradient
+      colors={theme.gradients.darkLuxury}
+      start={{
+        x: 0,
+        y: 0,
+      }}
+      end={{
+        x: 1,
+        y: 1,
+      }}
+      style={styles.screen}
+    >
+      <View
+        pointerEvents="none"
+        style={styles.topGlow}
+      />
+
+      <SafeAreaView
+        style={styles.safeArea}
+        edges={[
+          'top',
+          'bottom',
+        ]}
+      >
         <View style={styles.topBar}>
-          <IconButton icon="close" variant="glass" color={theme.colors.primaryDark} onPress={() => router.back()} />
-          <View style={styles.securePill}>
-            <Ionicons name="lock-closed" size={11} color={theme.colors.champagneLight} />
-            <Text style={styles.securePillText}>Paiement sécurisé Stripe</Text>
+          <IconButton
+            icon="close"
+            variant="glass"
+            color={theme.colors.white}
+            onPress={() => router.back()}
+          />
+
+          <View style={styles.secureNotice}>
+            <Ionicons
+              name="shield-checkmark-outline"
+              size={14}
+              color={theme.colors.champagneLight}
+            />
+
+            <Text style={styles.secureNoticeText}>
+              Paiement sécurisé
+            </Text>
           </View>
         </View>
 
         {isLoading ? (
-          <LoadingOverlay dark fullscreen label="Chargement des offres..." />
+          <LoadingOverlay
+            dark
+            fullscreen
+            label="Préparation des offres…"
+          />
         ) : (
           <>
             <ScrollView
-              style={{ flex: 1 }}
-              contentContainerStyle={styles.scrollBody}
+              contentContainerStyle={styles.content}
               showsVerticalScrollIndicator={false}
             >
-              {/* ---------------- HERO ---------------- */}
-              <Animated.View
-                style={{
-                  opacity: heroAnim,
-                  transform: [{ translateY: heroAnim.interpolate({ inputRange: [0, 1], outputRange: [16, 0] }) }],
-                }}
+              <View style={styles.heroIcon}>
+                <Ionicons
+                  name={
+                    mode === PAYWALL_MODES.EVENT
+                      ? 'sparkles-outline'
+                      : 'briefcase-outline'
+                  }
+                  size={27}
+                  color={theme.colors.primaryDark}
+                />
+              </View>
+
+              <Text style={styles.eyebrow}>
+                {copy.eyebrow}
+              </Text>
+
+              <Text style={styles.title}>
+                {copy.title}
+              </Text>
+
+              <Text style={styles.description}>
+                {copy.description}
+              </Text>
+
+              <View
+                accessibilityRole="tablist"
+                accessibilityLabel="Type d’offre"
+                style={styles.modeSwitch}
               >
-                <View style={styles.crownWrap}>
-                  <LinearGradient colors={theme.gradients.gold} style={styles.crownCircle}>
-                    <Ionicons name="ribbon" size={30} color={theme.colors.primaryDark} />
-                  </LinearGradient>
-                </View>
-                <Text style={styles.heroTitle}>Passez à{'\n'}Everia<Text style={{ color: theme.colors.champagne }}>+</Text></Text>
-                <Text style={styles.heroSubtitle}>
-                  Transformez chaque événement en une mémoire vivante, illimitée et sublimée par l'IA.
+                <ModeButton
+                  active={mode === PAYWALL_MODES.EVENT}
+                  label="Mon événement"
+                  onPress={() =>
+                    switchMode(PAYWALL_MODES.EVENT)
+                  }
+                />
+
+                <ModeButton
+                  active={mode === PAYWALL_MODES.PROFESSIONAL}
+                  label="Mon activité"
+                  onPress={() =>
+                    switchMode(PAYWALL_MODES.PROFESSIONAL)
+                  }
+                />
+              </View>
+
+              <View style={styles.proofRow}>
+                <Ionicons
+                  name="checkmark-circle"
+                  size={15}
+                  color={theme.colors.champagne}
+                />
+
+                <Text style={styles.proofText}>
+                  {copy.proof}
                 </Text>
+              </View>
 
-                <View style={styles.benefitsList}>
-                  {HERO_BENEFITS.map((b) => (
-                    <View key={b.label} style={styles.benefitRow}>
-                      <View style={styles.benefitIconWrap}>
-                        <Ionicons name={b.icon} size={16} color={theme.colors.champagne} />
-                      </View>
-                      <Text style={styles.benefitLabel}>{b.label}</Text>
-                    </View>
-                  ))}
-                </View>
-              </Animated.View>
-
-              {/* ---------------- PREUVE SOCIALE ---------------- */}
-              <Animated.View style={[styles.socialProofRow, { opacity: heroAnim }]}>
-                {SOCIAL_PROOF.map((s) => (
-                  <View key={s.label} style={styles.socialProofItem}>
-                    {s.icon === 'star' ? (
-                      <Ionicons name="star" size={14} color={theme.colors.champagne} />
-                    ) : (
-                      <Ionicons name={s.icon} size={14} color={theme.colors.champagne} />
-                    )}
-                    <Text style={styles.socialProofValue}>{s.value}</Text>
-                    <Text style={styles.socialProofLabel}>{s.label}</Text>
-                  </View>
+              <View style={styles.offerList}>
+                {plans.map((plan) => (
+                  <PlanCard
+                    key={plan.code}
+                    plan={plan}
+                    selected={
+                      plan.code === selectedCode
+                    }
+                    onPress={() => selectPlan(plan)}
+                  />
                 ))}
-              </Animated.View>
+              </View>
 
-              {/* ---------------- PLANS ---------------- */}
-              <Animated.View
-                style={{
-                  opacity: listAnim,
-                  transform: [{ translateY: listAnim.interpolate({ inputRange: [0, 1], outputRange: [24, 0] }) }],
-                  marginTop: theme.spacing.xxl,
-                }}
-              >
-                <Text style={styles.sectionLabel}>Choisissez votre formule</Text>
-                <View style={{ gap: theme.spacing.md }}>
-                  {paidPlans.map((plan) => (
-                    <PlanCard
-                      key={plan.id}
-                      plan={plan}
-                      selected={plan.code === selectedCode}
-                      badgePulse={badgePulse}
-                      onPress={() => selectPlan(plan.code)}
-                    />
-                  ))}
-                </View>
+              <View style={styles.noteBox}>
+                <Ionicons
+                  name="information-circle-outline"
+                  size={17}
+                  color={theme.colors.champagneLight}
+                />
 
-                {freePlan ? (
-                  <Pressable onPress={() => router.back()} style={styles.freeLinkWrap} hitSlop={8}>
-                    <Text style={styles.freeLinkText}>Continuer avec la formule gratuite</Text>
-                  </Pressable>
-                ) : null}
-              </Animated.View>
+                <Text style={styles.noteText}>
+                  {copy.footer}
+                </Text>
+              </View>
+
+              {!hasAvailablePlans ? (
+                <Pressable
+                  accessibilityRole="button"
+                  onPress={refresh}
+                  style={styles.retryButton}
+                >
+                  <Ionicons
+                    name="refresh-outline"
+                    size={16}
+                    color={theme.colors.champagneLight}
+                  />
+
+                  <Text style={styles.retryText}>
+                    Actualiser les offres
+                  </Text>
+                </Pressable>
+              ) : null}
             </ScrollView>
 
-            {/* ---------------- BARRE D'ACTION COLLANTE ---------------- */}
-            <Animated.View
-              style={[
-                styles.ctaBar,
-                {
-                  opacity: ctaAnim,
-                  transform: [{ translateY: ctaAnim.interpolate({ inputRange: [0, 1], outputRange: [30, 0] }) }],
-                },
-              ]}
-            >
-              <BlurView intensity={50} tint="dark" style={StyleSheet.absoluteFillObject} />
-              <View style={styles.ctaBarContent}>
-                <View style={{ flex: 1 }}>
-                  <Text style={styles.ctaPrice}>
-                    {selectedPlan ? formatPrice(selectedPlan.price_cents, selectedPlan.currency) : '—'}
-                    {selectedPlan?.billing_interval === 'month' && <Text style={styles.ctaPriceUnit}> /mois</Text>}
-                    {selectedPlan?.billing_interval === 'year' && <Text style={styles.ctaPriceUnit}> /an</Text>}
-                  </Text>
-                  <Text style={styles.ctaDisclaimer}>Sans engagement · Annulez à tout moment</Text>
-                </View>
-                <Pressable
-                  onPress={handleSubscribe}
-                  disabled={!selectedPlan || processingPlan === selectedPlan?.code}
-                  style={({ pressed }) => [styles.ctaButtonWrap, pressed && { transform: [{ scale: 0.98 }] }]}
-                >
-                  <LinearGradient colors={theme.gradients.gold} start={{ x: 0, y: 0 }} end={{ x: 1, y: 1 }} style={styles.ctaButton}>
-                    {processingPlan === selectedPlan?.code ? (
-                      <Text style={styles.ctaButtonText}>Traitement...</Text>
-                    ) : (
-                      <>
-                        <Text style={styles.ctaButtonText}>Continuer</Text>
-                        <Ionicons name="arrow-forward" size={16} color={theme.colors.primaryDark} style={{ marginLeft: 6 }} />
-                      </>
-                    )}
-                  </LinearGradient>
-                </Pressable>
+            <View style={styles.checkoutBar}>
+              <View style={styles.checkoutCopy}>
+                <Text style={styles.checkoutLabel}>
+                  {selectedPlan?.name ||
+                    'Choisissez une offre'}
+                </Text>
+
+                <Text style={styles.checkoutPrice}>
+                  {selectedPlan
+                    ? displayPrice(selectedPlan)
+                    : '—'}
+
+                  {selectedPlan ? (
+                    <Text style={styles.checkoutInterval}>
+                      {' '}
+                      {intervalLabel(selectedPlan)}
+                    </Text>
+                  ) : null}
+                </Text>
               </View>
-            </Animated.View>
+
+              <Pressable
+                accessibilityRole="button"
+                accessibilityState={{
+                  disabled: !selectedPlan ||
+                    !selectedPlan.available ||
+                    processingCode === selectedPlan.code,
+                }}
+                disabled={!selectedPlan ||
+                  !selectedPlan.available ||
+                  processingCode === selectedPlan.code}
+                onPress={openCheckout}
+                style={({
+                  pressed,
+                }) => [
+                  styles.checkoutButton,
+                  pressed && styles.checkoutButtonPressed,
+                  (!selectedPlan ||
+                    !selectedPlan.available) &&
+                    styles.checkoutButtonDisabled,
+                ]}
+              >
+                <LinearGradient
+                  colors={theme.gradients.gold}
+                  start={{
+                    x: 0,
+                    y: 0,
+                  }}
+                  end={{
+                    x: 1,
+                    y: 1,
+                  }}
+                  style={styles.checkoutButtonGradient}
+                >
+                  <Text style={styles.checkoutButtonText}>
+                    {processingCode === selectedPlan?.code
+                      ? 'Préparation…'
+                      : mode === PAYWALL_MODES.EVENT && !eventId
+                        ? copy.emptyAction
+                        : 'Continuer'}
+                  </Text>
+
+                  <Ionicons
+                    name="arrow-forward"
+                    size={17}
+                    color={theme.colors.primaryDark}
+                  />
+                </LinearGradient>
+              </Pressable>
+            </View>
           </>
         )}
       </SafeAreaView>
@@ -281,147 +615,532 @@ export default function Subscription() {
   );
 }
 
-// ================================================================
-// Carte de plan sélectionnable — état actif marqué par une bordure
-// dorée, une légère mise à l'échelle, une coche, et pour le plan mis
-// en avant, un ruban "Meilleure offre" au pouls discret.
-// ================================================================
-function PlanCard({ plan, selected, onPress, badgePulse }) {
-  const isFeatured = plan.code === 'everia_plus';
-  const scale = useRef(new Animated.Value(selected ? 1 : 0.98)).current;
-
-  useEffect(() => {
-    Animated.spring(scale, { toValue: selected ? 1 : 0.98, useNativeDriver: true, friction: 7 }).start();
-  }, [selected]);
-
-  const features = Array.isArray(plan.features?.list) ? plan.features.list : [];
-
+function ModeButton({
+  active,
+  label,
+  onPress,
+}) {
   return (
-    <Animated.View style={{ transform: [{ scale }] }}>
-      <Pressable onPress={onPress} style={[styles.planCard, selected && styles.planCardSelected]}>
-        {isFeatured && (
-          <Animated.View
-            style={[
-              styles.featuredRibbon,
-              {
-                transform: [
-                  {
-                    scale: badgePulse.interpolate({ inputRange: [0, 1], outputRange: [1, 1.06] }),
-                  },
-                ],
-              },
-            ]}
+    <Pressable
+      accessibilityRole="tab"
+      accessibilityState={{
+        selected: active,
+      }}
+      onPress={onPress}
+      style={[
+        styles.modeButton,
+        active && styles.modeButtonActive,
+      ]}
+    >
+      <Text
+        style={[
+          styles.modeButtonText,
+          active && styles.modeButtonTextActive,
+        ]}
+      >
+        {label}
+      </Text>
+    </Pressable>
+  );
+}
+
+function PlanCard({
+  plan,
+  selected,
+  onPress,
+}) {
+  return (
+    <Pressable
+      accessibilityRole="radio"
+      accessibilityState={{
+        checked: selected,
+        disabled: !plan.available,
+      }}
+      onPress={onPress}
+      style={({
+        pressed,
+      }) => [
+        styles.planCard,
+        selected && styles.planCardSelected,
+        !plan.available && styles.planCardUnavailable,
+        pressed && plan.available && styles.planCardPressed,
+      ]}
+    >
+      {plan.badge ? (
+        <View style={styles.planBadge}>
+          <Ionicons
+            name="sparkles"
+            size={11}
+            color={theme.colors.primaryDark}
+          />
+
+          <Text style={styles.planBadgeText}>
+            {plan.badge}
+          </Text>
+        </View>
+      ) : null}
+
+      <View style={styles.planTopRow}>
+        <View style={styles.planCopy}>
+          <Text style={styles.planName}>
+            {plan.name}
+          </Text>
+
+          <Text style={styles.planTagline}>
+            {plan.tagline}
+          </Text>
+        </View>
+
+        <View
+          style={[
+            styles.radio,
+            selected && styles.radioSelected,
+          ]}
+        >
+          {selected ? (
+            <View style={styles.radioFill} />
+          ) : null}
+        </View>
+      </View>
+
+      <View style={styles.priceRow}>
+        <Text style={styles.planPrice}>
+          {displayPrice(plan)}
+        </Text>
+
+        <Text style={styles.planInterval}>
+          {intervalLabel(plan)}
+        </Text>
+      </View>
+
+      <Text style={styles.planOutcome}>
+        {plan.outcome}
+      </Text>
+
+      <View style={styles.featureList}>
+        {plan.included.map((feature) => (
+          <View
+            key={feature}
+            style={styles.featureRow}
           >
-            <Ionicons name="flash" size={11} color={theme.colors.primaryDark} />
-            <Text style={styles.featuredRibbonText}>MEILLEURE OFFRE</Text>
-          </Animated.View>
-        )}
+            <Ionicons
+              name="checkmark"
+              size={15}
+              color={theme.colors.champagne}
+            />
 
-        <View style={styles.planCardHeader}>
-          <View style={{ flex: 1 }}>
-            <Text style={[styles.planName, { color: selected ? theme.colors.champagne : theme.colors.white }]}>{plan.name}</Text>
-            {plan.description ? <Text style={styles.planDescription}>{plan.description}</Text> : null}
+            <Text style={styles.featureText}>
+              {feature}
+            </Text>
           </View>
-          <View style={[styles.radioOuter, selected && styles.radioOuterSelected]}>
-            {selected && <View style={styles.radioInner} />}
-          </View>
-        </View>
+        ))}
+      </View>
 
-        <View style={styles.planPriceRow}>
-          <Text style={styles.planPrice}>{formatPrice(plan.price_cents, plan.currency)}</Text>
-          {plan.billing_interval === 'month' && <Text style={styles.planInterval}>/mois</Text>}
-          {plan.billing_interval === 'year' && <Text style={styles.planInterval}>/an</Text>}
-          {plan.billing_interval === 'one_time' && <Text style={styles.planInterval}>paiement unique</Text>}
-        </View>
-
-        {features.length > 0 && (
-          <View style={styles.planFeatures}>
-            {features.map((feature) => (
-              <View key={feature} style={styles.planFeatureRow}>
-                <Ionicons name="checkmark-circle" size={15} color={selected ? theme.colors.champagne : 'rgba(255,255,255,0.4)'} />
-                <Text style={styles.planFeatureText}>{feature}</Text>
-              </View>
-            ))}
-          </View>
-        )}
-      </Pressable>
-    </Animated.View>
+      {!plan.available ? (
+        <Text style={styles.unavailableText}>
+          Configuration de paiement en cours
+        </Text>
+      ) : null}
+    </Pressable>
   );
 }
 
 const styles = StyleSheet.create({
-  glowWrap: { position: 'absolute', top: -80, left: 0, right: 0, height: 320, alignItems: 'center' },
-  glow: { width: 420, height: 420, borderRadius: 210 },
-  sparkleTL: { position: 'absolute', top: 90, left: 28 },
-  sparkleTR: { position: 'absolute', top: 140, right: 40 },
+  screen: {
+    flex: 1,
+  },
 
-  topBar: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', paddingHorizontal: theme.layout.screenHorizontal, paddingTop: 4 },
-  securePill: { flexDirection: 'row', alignItems: 'center', gap: 5, backgroundColor: 'rgba(217,184,120,0.12)', borderWidth: 1, borderColor: 'rgba(217,184,120,0.3)', paddingHorizontal: 10, height: 28, borderRadius: 999 },
-  securePillText: { color: theme.colors.champagneLight, fontFamily: theme.typography.families.bodySemiBold, fontSize: 10, letterSpacing: 0.3 },
+  safeArea: {
+    flex: 1,
+  },
 
-  scrollBody: { paddingHorizontal: theme.layout.screenHorizontal, paddingTop: theme.spacing.lg, paddingBottom: 160 },
-
-  crownWrap: { alignItems: 'center', marginBottom: theme.spacing.lg },
-  crownCircle: { width: 68, height: 68, borderRadius: 24, alignItems: 'center', justifyContent: 'center', ...theme.shadows.gold },
-
-  heroTitle: { ...theme.typography.styles.displayDark, fontSize: 34, lineHeight: 40, textAlign: 'center' },
-  heroSubtitle: { color: theme.colors.textOnDark, opacity: 0.68, fontFamily: theme.typography.families.body, fontSize: 13.5, lineHeight: 20, textAlign: 'center', marginTop: theme.spacing.md, maxWidth: 300, alignSelf: 'center' },
-
-  benefitsList: { marginTop: theme.spacing.xxl, gap: theme.spacing.md },
-  benefitRow: { flexDirection: 'row', alignItems: 'center', gap: 12 },
-  benefitIconWrap: { width: 30, height: 30, borderRadius: 10, backgroundColor: 'rgba(217,184,120,0.14)', alignItems: 'center', justifyContent: 'center' },
-  benefitLabel: { flex: 1, color: theme.colors.white, fontFamily: theme.typography.families.bodyMedium, fontSize: 13.5 },
-
-  socialProofRow: { flexDirection: 'row', justifyContent: 'space-between', marginTop: theme.spacing.xxl, backgroundColor: 'rgba(255,255,255,0.04)', borderRadius: theme.radius.lg, borderWidth: 1, borderColor: 'rgba(255,255,255,0.08)', paddingVertical: theme.spacing.md },
-  socialProofItem: { flex: 1, alignItems: 'center', gap: 3 },
-  socialProofValue: { color: theme.colors.white, fontFamily: theme.typography.families.displaySemiBold, fontSize: 15, marginTop: 2 },
-  socialProofLabel: { color: theme.colors.textOnDark, opacity: 0.55, fontFamily: theme.typography.families.body, fontSize: 9.5 },
-
-  sectionLabel: { color: theme.colors.textOnDark, opacity: 0.6, fontFamily: theme.typography.families.bodySemiBold, fontSize: 11, letterSpacing: 1.4, textTransform: 'uppercase', marginBottom: theme.spacing.md },
-
-  planCard: { borderRadius: theme.radius.xl, backgroundColor: theme.colors.surfaceDark2, borderWidth: 1.5, borderColor: 'rgba(255,255,255,0.08)', padding: theme.spacing.lg, overflow: 'visible' },
-  planCardSelected: { borderColor: theme.colors.champagne, backgroundColor: theme.colors.surfaceDark3, ...theme.shadows.gold },
-
-  featuredRibbon: {
+  topGlow: {
     position: 'absolute',
-    top: -12,
-    left: theme.spacing.lg,
+    top: -120,
+    alignSelf: 'center',
+    width: 360,
+    height: 310,
+    borderRadius: 180,
+    backgroundColor: 'rgba(217,184,120,0.16)',
+  },
+
+  topBar: {
+    minHeight: 54,
+    paddingHorizontal: theme.layout.screenHorizontal,
+    alignItems: 'center',
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+  },
+
+  secureNotice: {
+    flexDirection: 'row',
+    gap: 6,
+    alignItems: 'center',
+    paddingHorizontal: 10,
+    height: 30,
+    borderRadius: 15,
+    backgroundColor: 'rgba(255,255,255,0.06)',
+    borderWidth: 1,
+    borderColor: 'rgba(255,255,255,0.1)',
+  },
+
+  secureNoticeText: {
+    color: theme.colors.white70,
+    fontFamily: theme.typography.families.bodyMedium,
+    fontSize: 10,
+  },
+
+  content: {
+    paddingHorizontal: theme.layout.screenHorizontal,
+    paddingTop: 12,
+    paddingBottom: 146,
+  },
+
+  heroIcon: {
+    alignSelf: 'center',
+    width: 64,
+    height: 64,
+    borderRadius: 23,
+    backgroundColor: theme.colors.champagne,
+    alignItems: 'center',
+    justifyContent: 'center',
+    ...theme.shadows.gold,
+  },
+
+  eyebrow: {
+    color: theme.colors.champagneLight,
+    fontFamily: theme.typography.families.bodySemiBold,
+    fontSize: 9,
+    letterSpacing: 1.4,
+    textAlign: 'center',
+    marginTop: 18,
+  },
+
+  title: {
+    color: theme.colors.white,
+    fontFamily: theme.typography.families.displaySemiBold,
+    fontSize: 29,
+    letterSpacing: -0.6,
+    lineHeight: 35,
+    textAlign: 'center',
+    marginTop: 8,
+  },
+
+  description: {
+    color: theme.colors.white70,
+    fontFamily: theme.typography.families.body,
+    fontSize: 13,
+    lineHeight: 20,
+    textAlign: 'center',
+    marginTop: 10,
+    maxWidth: 345,
+    alignSelf: 'center',
+  },
+
+  modeSwitch: {
+    flexDirection: 'row',
+    padding: 4,
+    marginTop: 23,
+    borderRadius: 16,
+    backgroundColor: 'rgba(255,255,255,0.06)',
+    borderWidth: 1,
+    borderColor: 'rgba(255,255,255,0.08)',
+  },
+
+  modeButton: {
+    flex: 1,
+    minHeight: 38,
+    alignItems: 'center',
+    justifyContent: 'center',
+    borderRadius: 12,
+  },
+
+  modeButtonActive: {
+    backgroundColor: theme.colors.champagne,
+  },
+
+  modeButtonText: {
+    color: theme.colors.white60,
+    fontFamily: theme.typography.families.bodySemiBold,
+    fontSize: 11,
+  },
+
+  modeButtonTextActive: {
+    color: theme.colors.primaryDark,
+  },
+
+  proofRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: 7,
+    marginTop: 14,
+  },
+
+  proofText: {
+    color: theme.colors.white60,
+    fontFamily: theme.typography.families.body,
+    fontSize: 10.5,
+    textAlign: 'center',
+  },
+
+  offerList: {
+    gap: 14,
+    marginTop: 25,
+  },
+
+  planCard: {
+    position: 'relative',
+    borderWidth: 1,
+    borderColor: 'rgba(255,255,255,0.1)',
+    borderRadius: 24,
+    padding: 18,
+    overflow: 'hidden',
+    backgroundColor: 'rgba(42,22,45,0.88)',
+  },
+
+  planCardSelected: {
+    borderColor: theme.colors.champagne,
+    backgroundColor: theme.colors.surfaceDark3,
+    ...theme.shadows.gold,
+  },
+
+  planCardUnavailable: {
+    opacity: 0.54,
+  },
+
+  planCardPressed: {
+    transform: [
+      {
+        scale: 0.985,
+      },
+    ],
+  },
+
+  planBadge: {
+    position: 'absolute',
+    top: 0,
+    right: 0,
     flexDirection: 'row',
     alignItems: 'center',
     gap: 4,
     backgroundColor: theme.colors.champagne,
+    borderBottomLeftRadius: 14,
     paddingHorizontal: 10,
-    height: 22,
-    borderRadius: 999,
-    ...theme.shadows.gold,
+    height: 25,
   },
-  featuredRibbonText: { color: theme.colors.primaryDark, fontFamily: theme.typography.families.bodyBold, fontSize: 9, letterSpacing: 0.6 },
 
-  planCardHeader: { flexDirection: 'row', alignItems: 'flex-start', justifyContent: 'space-between' },
-  planName: { fontFamily: theme.typography.families.displaySemiBold, fontSize: 17 },
-  planDescription: { color: theme.colors.textOnDark, opacity: 0.55, fontFamily: theme.typography.families.body, fontSize: 11.5, marginTop: 3, lineHeight: 16 },
+  planBadgeText: {
+    color: theme.colors.primaryDark,
+    fontFamily: theme.typography.families.bodyBold,
+    fontSize: 8,
+    letterSpacing: 0.8,
+  },
 
-  radioOuter: { width: 22, height: 22, borderRadius: 11, borderWidth: 1.5, borderColor: 'rgba(255,255,255,0.3)', alignItems: 'center', justifyContent: 'center', marginLeft: 10 },
-  radioOuterSelected: { borderColor: theme.colors.champagne },
-  radioInner: { width: 11, height: 11, borderRadius: 6, backgroundColor: theme.colors.champagne },
+  planTopRow: {
+    flexDirection: 'row',
+    gap: 12,
+    alignItems: 'flex-start',
+    justifyContent: 'space-between',
+  },
 
-  planPriceRow: { flexDirection: 'row', alignItems: 'flex-end', gap: 6, marginTop: theme.spacing.md },
-  planPrice: { color: theme.colors.white, fontFamily: theme.typography.families.displaySemiBold, fontSize: 24 },
-  planInterval: { color: theme.colors.textOnDark, opacity: 0.55, fontFamily: theme.typography.families.body, fontSize: 12, marginBottom: 3 },
+  planCopy: {
+    flex: 1,
+    paddingRight: 52,
+  },
 
-  planFeatures: { marginTop: theme.spacing.md, gap: 7, borderTopWidth: 1, borderTopColor: 'rgba(255,255,255,0.08)', paddingTop: theme.spacing.md },
-  planFeatureRow: { flexDirection: 'row', alignItems: 'center', gap: 8 },
-  planFeatureText: { flex: 1, color: theme.colors.textOnDark, opacity: 0.85, fontFamily: theme.typography.families.body, fontSize: 12.5 },
+  planName: {
+    color: theme.colors.white,
+    fontFamily: theme.typography.families.displaySemiBold,
+    fontSize: 19,
+  },
 
-  freeLinkWrap: { alignItems: 'center', marginTop: theme.spacing.xl },
-  freeLinkText: { color: theme.colors.textOnDark, opacity: 0.5, fontFamily: theme.typography.families.bodyMedium, fontSize: 12.5, textDecorationLine: 'underline' },
+  planTagline: {
+    color: theme.colors.champagneLight,
+    fontFamily: theme.typography.families.bodyMedium,
+    fontSize: 11,
+    marginTop: 3,
+  },
 
-  ctaBar: { position: 'absolute', left: 0, right: 0, bottom: 0, borderTopWidth: 1, borderTopColor: 'rgba(255,255,255,0.1)', overflow: 'hidden' },
-  ctaBarContent: { flexDirection: 'row', alignItems: 'center', paddingHorizontal: theme.layout.screenHorizontal, paddingTop: theme.spacing.md, paddingBottom: theme.spacing.lg, gap: theme.spacing.md },
-  ctaPrice: { color: theme.colors.white, fontFamily: theme.typography.families.displaySemiBold, fontSize: 19 },
-  ctaPriceUnit: { color: theme.colors.textOnDark, opacity: 0.6, fontFamily: theme.typography.families.body, fontSize: 12 },
-  ctaDisclaimer: { color: theme.colors.textOnDark, opacity: 0.5, fontFamily: theme.typography.families.body, fontSize: 10.5, marginTop: 2 },
-  ctaButtonWrap: { borderRadius: theme.radius.buttonLarge, overflow: 'hidden' },
-  ctaButton: { flexDirection: 'row', alignItems: 'center', justifyContent: 'center', height: 52, paddingHorizontal: theme.spacing.xxl },
-  ctaButtonText: { color: theme.colors.primaryDark, fontFamily: theme.typography.families.bodyBold, fontSize: 14.5 },
+  radio: {
+    width: 22,
+    height: 22,
+    borderRadius: 11,
+    alignItems: 'center',
+    justifyContent: 'center',
+    borderWidth: 1.5,
+    borderColor: 'rgba(255,255,255,0.36)',
+  },
+
+  radioSelected: {
+    borderColor: theme.colors.champagne,
+  },
+
+  radioFill: {
+    width: 11,
+    height: 11,
+    borderRadius: 6,
+    backgroundColor: theme.colors.champagne,
+  },
+
+  priceRow: {
+    flexDirection: 'row',
+    alignItems: 'baseline',
+    gap: 6,
+    marginTop: 16,
+  },
+
+  planPrice: {
+    color: theme.colors.white,
+    fontFamily: theme.typography.families.displaySemiBold,
+    fontSize: 27,
+    letterSpacing: -0.6,
+  },
+
+  planInterval: {
+    color: theme.colors.white60,
+    fontFamily: theme.typography.families.body,
+    fontSize: 11,
+  },
+
+  planOutcome: {
+    color: theme.colors.white70,
+    fontFamily: theme.typography.families.body,
+    fontSize: 12,
+    lineHeight: 18,
+    marginTop: 8,
+  },
+
+  featureList: {
+    gap: 7,
+    marginTop: 14,
+  },
+
+  featureRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 7,
+  },
+
+  featureText: {
+    flex: 1,
+    color: theme.colors.white70,
+    fontFamily: theme.typography.families.body,
+    fontSize: 11,
+    lineHeight: 16,
+  },
+
+  unavailableText: {
+    color: theme.colors.champagneLight,
+    fontFamily: theme.typography.families.bodyMedium,
+    fontSize: 10,
+    marginTop: 13,
+  },
+
+  noteBox: {
+    flexDirection: 'row',
+    gap: 9,
+    alignItems: 'flex-start',
+    marginTop: 20,
+    padding: 14,
+    borderRadius: 16,
+    backgroundColor: 'rgba(217,184,120,0.09)',
+    borderWidth: 1,
+    borderColor: 'rgba(217,184,120,0.2)',
+  },
+
+  noteText: {
+    flex: 1,
+    color: theme.colors.white70,
+    fontFamily: theme.typography.families.body,
+    fontSize: 10.5,
+    lineHeight: 16,
+  },
+
+  retryButton: {
+    alignSelf: 'center',
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 7,
+    minHeight: 44,
+    marginTop: 10,
+  },
+
+  retryText: {
+    color: theme.colors.champagneLight,
+    fontFamily: theme.typography.families.bodySemiBold,
+    fontSize: 12,
+  },
+
+  checkoutBar: {
+    position: 'absolute',
+    left: 0,
+    right: 0,
+    bottom: 0,
+    minHeight: 92,
+    paddingHorizontal: theme.layout.screenHorizontal,
+    paddingVertical: 12,
+    flexDirection: 'row',
+    gap: 12,
+    alignItems: 'center',
+    borderTopWidth: 1,
+    borderTopColor: 'rgba(255,255,255,0.1)',
+    backgroundColor: 'rgba(22,10,24,0.98)',
+  },
+
+  checkoutCopy: {
+    flex: 1,
+  },
+
+  checkoutLabel: {
+    color: theme.colors.white60,
+    fontFamily: theme.typography.families.bodyMedium,
+    fontSize: 10,
+  },
+
+  checkoutPrice: {
+    color: theme.colors.white,
+    fontFamily: theme.typography.families.displaySemiBold,
+    fontSize: 20,
+    marginTop: 2,
+  },
+
+  checkoutInterval: {
+    color: theme.colors.white60,
+    fontFamily: theme.typography.families.body,
+    fontSize: 10,
+  },
+
+  checkoutButton: {
+    overflow: 'hidden',
+    borderRadius: 16,
+  },
+
+  checkoutButtonPressed: {
+    transform: [
+      {
+        scale: 0.98,
+      },
+    ],
+  },
+
+  checkoutButtonDisabled: {
+    opacity: 0.5,
+  },
+
+  checkoutButtonGradient: {
+    minHeight: 52,
+    minWidth: 141,
+    paddingHorizontal: 15,
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: 7,
+  },
+
+  checkoutButtonText: {
+    color: theme.colors.primaryDark,
+    fontFamily: theme.typography.families.bodyBold,
+    fontSize: 12,
+  },
 });

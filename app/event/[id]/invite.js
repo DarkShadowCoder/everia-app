@@ -10,6 +10,7 @@ import Button from '@/components/ui/Button';
 import { useEventStore } from '@/store/eventStore';
 import { useUIStore } from '@/store/uiStore';
 import { APP_SCHEME } from '@/constants/config';
+import { buildEventJoinUrl } from '@/lib/eventLinks';
 
 export default function InviteModal() {
   const { id } = useLocalSearchParams();
@@ -18,7 +19,11 @@ export default function InviteModal() {
 
   if (!event) return null;
 
-  const qrValue = `${APP_SCHEME}://join?code=${event.event_code}`;
+  const webJoinUrl = buildEventJoinUrl(event.event_code);
+
+  // Le fallback natif simplifie les tests locaux. En production,
+  // EXPO_PUBLIC_WEB_APP_URL doit être défini pour que le QR ouvre le web.
+  const qrValue = webJoinUrl || `${APP_SCHEME}://join?code=${event.event_code}`;
 
   const copyCode = async () => {
     await Clipboard.setStringAsync(event.event_code);
@@ -27,7 +32,9 @@ export default function InviteModal() {
 
   const shareInvite = async () => {
     await Share.share({
-      message: `Rejoins "${event.name}" sur Everia avec le code ${event.event_code} ou ce lien : ${qrValue}`,
+      message: webJoinUrl
+        ? `Rejoins « ${event.name} » sur Everia : ${webJoinUrl}`
+        : `Rejoins « ${event.name} » sur Everia avec le code ${event.event_code}.`,
     });
   };
 
